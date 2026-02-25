@@ -40,6 +40,7 @@ document.addEventListener("DOMContentLoaded", () => {
   let searchQuery = "";
   let currentDay = "";
   let currentTimeRange = "";
+  let currentView = "card";
 
   // Authentication state
   let currentUser = null;
@@ -258,6 +259,12 @@ document.addEventListener("DOMContentLoaded", () => {
   function showLoadingSkeletons() {
     activitiesList.innerHTML = "";
 
+    if (currentView === "calendar") {
+      activitiesList.innerHTML =
+        '<p style="padding:20px;color:var(--text-secondary)">Loading activities...</p>';
+      return;
+    }
+
     // Create more skeleton cards to fill the screen since they're smaller now
     for (let i = 0; i < 9; i++) {
       const skeletonCard = document.createElement("div");
@@ -456,7 +463,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     // Check if there are any results
-    if (Object.keys(filteredActivities).length === 0) {
+    if (Object.keys(filteredActivities).length === 0 && currentView !== "calendar") {
       activitiesList.innerHTML = `
         <div class="no-results">
           <h4>No activities found</h4>
@@ -467,9 +474,15 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // Display filtered activities
-    Object.entries(filteredActivities).forEach(([name, details]) => {
-      renderActivityCard(name, details);
-    });
+    if (currentView === "calendar") {
+      activitiesList.classList.add("calendar-mode");
+      renderCalendarView(filteredActivities);
+    } else {
+      activitiesList.classList.remove("calendar-mode");
+      Object.entries(filteredActivities).forEach(([name, details]) => {
+        renderActivityCard(name, details);
+      });
+    }
   }
 
   // Function to render a single activity card
@@ -589,6 +602,242 @@ document.addEventListener("DOMContentLoaded", () => {
 
     activitiesList.appendChild(activityCard);
   }
+
+  // ── Calendar View ─────────────────────────────────────────────────────────
+
+  // Single shared tooltip for calendar events (position: fixed avoids clip)
+  const calTooltip = document.createElement("div");
+  calTooltip.id = "cal-tooltip";
+  calTooltip.className = "cal-tooltip hidden";
+  document.body.appendChild(calTooltip);
+
+  function showCalTooltip(eventEl, name, details) {
+    const takenSpots = details.participants.length;
+    const totalSpots = details.max_participants;
+    const spotsLeft = totalSpots - takenSpots;
+    const formattedSchedule = formatSchedule(details);
+
+    calTooltip.innerHTML = `
+      <div class="cal-tooltip-title">${name}</div>
+      <p>${details.description}</p>
+      <p><strong>Schedule:</strong> ${formattedSchedule}</p>
+      <p><strong>Enrollment:</strong> ${takenSpots}/${totalSpots} (${spotsLeft} spots left)</p>
+    `;
+
+    const rect = eventEl.getBoundingClientRect();
+    calTooltip.classList.remove("hidden");
+
+    // Default: show to the right of the event
+    let left = rect.right + 8;
+    let top = rect.top;
+
+    // Flip left if tooltip would go off-screen
+    const tipRect = calTooltip.getBoundingClientRect();
+    if (left + tipRect.width > window.innerWidth - 8) {
+      left = rect.left - tipRect.width - 8;
+    }
+    // Keep within vertical bounds
+    if (top + tipRect.height > window.innerHeight - 8) {
+      top = window.innerHeight - tipRect.height - 8;
+    }
+
+    calTooltip.style.left = `${left}px`;
+    calTooltip.style.top = `${top}px`;
+  }
+
+  function hideCalTooltip() {
+    calTooltip.classList.add("hidden");
+  }
+
+  // Assign non-overlapping columns to a list of activities on one day
+  function positionActivities(activities, startHour, hourHeight) {
+    if (activities.length === 0) return [];
+
+    function timeToMinutes(timeStr) {
+      const [h, m] = timeStr.split(":").map(Number);
+      return h * 60 + m;
+    }
+
+    const pixelsPerMinute = hourHeight / 60;
+    const startMinutes = startHour * 60;
+
+    const events = activities
+      .map((a) => ({
+        activity: a,
+        startMin: timeToMinutes(a.details.schedule_details.start_time),
+        endMin: timeToMinutes(a.details.schedule_details.end_time),
+        col: -1,
+        numCols: 1,
+      }))
+      .sort((a, b) => a.startMin - b.startMin);
+
+    // Greedy column assignment
+    const columns = []; // columns[i] = end time of last event placed in column i
+    events.forEach((event) => {
+      let col = columns.findIndex((endTime) => endTime <= event.startMin);
+      if (col === -1) {
+        col = columns.length;
+        columns.push(event.endMin);
+      } else {
+        columns[col] = event.endMin;
+      }
+      event.col = col;
+    });
+
+    // Determine width: count concurrent events for each event
+    events.forEach((event) => {
+      const concurrent = events.filter(
+        (e) => e.startMin < event.endMin && e.endMin > event.startMin
+      );
+      event.numCols = Math.max(...concurrent.map((e) => e.col)) + 1;
+    });
+
+    return events.map((event) => ({
+      activity: event.activity,
+      top: Math.max(0, (event.startMin - startMinutes) * pixelsPerMinute),
+      height: Math.max(24, (event.endMin - event.startMin) * pixelsPerMinute),
+      left: event.col / event.numCols,
+      width: 1 / event.numCols,
+    }));
+  }
+
+  // Render the weekly calendar view
+  function renderCalendarView(filteredActivities) {
+    activitiesList.innerHTML = "";
+
+    const HOUR_HEIGHT = 60; // px per hour
+    const START_HOUR = 6;   // 6 AM
+    const END_HOUR = 18;    // 6 PM
+    const TOTAL_HOURS = END_HOUR - START_HOUR;
+    const DAYS = [
+      "Sunday", "Monday", "Tuesday", "Wednesday",
+      "Thursday", "Friday", "Saturday",
+    ];
+    const DAY_ABBR = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+    // Outer scrollable wrapper
+    const wrapper = document.createElement("div");
+    wrapper.className = "cal-wrapper";
+
+    // Header row (day names)
+    const header = document.createElement("div");
+    header.className = "cal-header";
+    header.innerHTML = '<div class="cal-time-gutter"></div>';
+    DAY_ABBR.forEach((abbr) => {
+      const cell = document.createElement("div");
+      cell.className = "cal-day-header";
+      cell.textContent = abbr;
+      header.appendChild(cell);
+    });
+
+    // Body: time axis + grid columns
+    const body = document.createElement("div");
+    body.className = "cal-body";
+
+    // Time axis
+    const timeAxis = document.createElement("div");
+    timeAxis.className = "cal-time-axis";
+    for (let h = START_HOUR; h <= END_HOUR; h++) {
+      const label = document.createElement("div");
+      label.className = "cal-hour-label";
+      if (h < END_HOUR) label.style.height = `${HOUR_HEIGHT}px`;
+      const period = h >= 12 ? "PM" : "AM";
+      const displayH = h % 12 || 12;
+      label.textContent = `${displayH}:00 ${period}`;
+      timeAxis.appendChild(label);
+    }
+
+    // Grid (day columns)
+    const grid = document.createElement("div");
+    grid.className = "cal-grid";
+
+    // Organise activities by day
+    const activitiesByDay = {};
+    DAYS.forEach((d) => (activitiesByDay[d] = []));
+
+    Object.entries(filteredActivities).forEach(([name, details]) => {
+      if (!details.schedule_details) return;
+      details.schedule_details.days.forEach((day) => {
+        if (DAYS.includes(day)) {
+          activitiesByDay[day].push({ name, details });
+        }
+      });
+    });
+
+    DAYS.forEach((day) => {
+      const col = document.createElement("div");
+      col.className = "cal-day-col";
+      col.style.height = `${TOTAL_HOURS * HOUR_HEIGHT}px`;
+
+      const positioned = positionActivities(
+        activitiesByDay[day],
+        START_HOUR,
+        HOUR_HEIGHT
+      );
+
+      positioned.forEach(({ activity, top, height, left, width }) => {
+        const { name, details } = activity;
+        const activityType = getActivityType(name, details.description);
+        const typeInfo = activityTypes[activityType];
+        const takenSpots = details.participants.length;
+        const totalSpots = details.max_participants;
+
+        const eventEl = document.createElement("div");
+        eventEl.className = "cal-event";
+        eventEl.style.cssText = `
+          top: ${top}px;
+          height: ${height}px;
+          left: calc(${left * 100}% + 1px);
+          width: calc(${width * 100}% - 2px);
+          background-color: ${typeInfo.color};
+          color: ${typeInfo.textColor};
+          border-left-color: ${typeInfo.textColor};
+        `;
+        eventEl.innerHTML = `
+          <span class="cal-event-name">${name}</span>
+          <span class="cal-event-count">${takenSpots}/${totalSpots}</span>
+        `;
+
+        eventEl.addEventListener("mouseenter", () =>
+          showCalTooltip(eventEl, name, details)
+        );
+        eventEl.addEventListener("mouseleave", hideCalTooltip);
+
+        col.appendChild(eventEl);
+      });
+
+      grid.appendChild(col);
+    });
+
+    body.appendChild(timeAxis);
+    body.appendChild(grid);
+    wrapper.appendChild(header);
+    wrapper.appendChild(body);
+    activitiesList.appendChild(wrapper);
+  }
+
+  // View toggle buttons
+  const cardViewBtn = document.getElementById("card-view-btn");
+  const calendarViewBtn = document.getElementById("calendar-view-btn");
+
+  cardViewBtn.addEventListener("click", () => {
+    if (currentView === "card") return;
+    currentView = "card";
+    cardViewBtn.classList.add("active");
+    calendarViewBtn.classList.remove("active");
+    activitiesList.classList.remove("calendar-mode");
+    displayFilteredActivities();
+  });
+
+  calendarViewBtn.addEventListener("click", () => {
+    if (currentView === "calendar") return;
+    currentView = "calendar";
+    calendarViewBtn.classList.add("active");
+    cardViewBtn.classList.remove("active");
+    displayFilteredActivities();
+  });
+
+  // ── End Calendar View ──────────────────────────────────────────────────────
 
   // Event listeners for search and filter
   searchInput.addEventListener("input", (event) => {
